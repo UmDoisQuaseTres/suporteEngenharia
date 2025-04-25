@@ -258,6 +258,7 @@ poetry.toml
 # ruff
 .ruff_cache/
 
+whatsapp_data.db
 # LSP config files
 pyrightconfig.json
 
