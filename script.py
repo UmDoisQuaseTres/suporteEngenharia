@@ -3,38 +3,96 @@ import json
 import hmac
 import hashlib
 import time
-from flask import Flask, request, abort, Response
-from threading import Lock # Para segurança de thread com variáveis globais
+import sqlite3 # Importa a biblioteca SQLite
+from flask import Flask, request, abort, Response, g # g é útil para gerenciar conexões
 
 app = Flask(__name__)
 
 # --- Configuração ---
+# Use o token que você definiu no painel da Meta
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "zas")
+# !! IMPORTANTE: Use o SEU App Secret REAL aqui ou via variável de ambiente !!
 APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "12481c3321479a59724a976f1241de06")
+# Nome do arquivo do banco de dados SQLite
+DATABASE = 'whatsapp_data.db'
 
-# --- Gerenciamento de Estado (Simples - Use um BD em produção!) ---
-# Dicionário para guardar o status das conversas { sender_id: {'status': 'open'/'closed', 'last_update': timestamp} }
-conversation_status = {}
-# Contador de novas conversas
-new_conversation_count = 0
-# Lock para proteger o acesso concorrente ao contador e ao dicionário
-data_lock = Lock()
+# --- Funções do Banco de Dados ---
 
-# --- Endpoint do Webhook ---
+def get_db():
+    """Abre uma nova conexão com o banco de dados se não houver uma para a requisição atual."""
+    # g é um objeto especial do Flask que é único para cada requisição.
+    # Usado para armazenar dados que podem ser acessados múltiplas vezes durante uma requisição.
+    db = getattr(g, '_database', None)
+    if db is None:
+        print(f"Conectando ao banco de dados: {DATABASE}")
+        try:
+            db = g._database = sqlite3.connect(DATABASE)
+            # Configura para que as linhas retornadas sejam como dicionários (acesso por nome de coluna)
+            db.row_factory = sqlite3.Row
+            print("Conexão estabelecida.")
+        except sqlite3.Error as e:
+            print(f"Erro ao conectar ao banco de dados: {e}")
+            raise # Re-levanta a exceção para que o Flask a capture
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    """Fecha a conexão com o banco de dados ao final da requisição."""
+    db = getattr(g, '_database', None)
+    if db is not None:
+        try:
+            db.close()
+            print("Conexão com o banco de dados fechada.")
+        except sqlite3.Error as e:
+            print(f"Erro ao fechar a conexão com o banco de dados: {e}")
+
+
+def init_db():
+    """Cria as tabelas do banco de dados se elas não existirem."""
+    print("Tentando inicializar o banco de dados...")
+    try:
+        # Usamos app_context para poder usar get_db fora de uma requisição HTTP
+        with app.app_context():
+            db = get_db()
+            cursor = db.cursor()
+            print("Criando tabela 'conversations' (se não existir)...")
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS conversations (
+                    sender_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    last_update INTEGER NOT NULL
+                )
+            ''')
+            print("Criando tabela 'counters' (se não existir)...")
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS counters (
+                    counter_name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )
+            ''')
+            print("Inserindo contador inicial 'new_conversation_count' (se não existir)...")
+            # Insere o contador inicial apenas se ele não existir ainda
+            cursor.execute('''
+                INSERT OR IGNORE INTO counters (counter_name, value) VALUES (?, ?)
+            ''', ('new_conversation_count', 0))
+            db.commit() # Salva as alterações
+            print("Banco de dados inicializado com sucesso.")
+    except sqlite3.Error as e:
+        print(f"Erro de SQLite durante init_db: {e}")
+    except Exception as e:
+        print(f"Erro inesperado durante init_db: {e}")
+
+# --- Endpoint do Webhook (Modificado para usar DB) ---
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
-    global new_conversation_count # Precisamos declarar global para modificar
-    global conversation_status
-
     if request.method == 'GET':
         # --- Verificação do Webhook (GET) ---
+        # (Lógica inalterada, já funciona)
         verify_token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
         mode = request.args.get('hub.mode')
-
         print(f"Recebido GET - Mode: {mode}, Token: {verify_token}, Challenge: {challenge}")
-
         if mode == 'subscribe' and verify_token == VERIFY_TOKEN:
             print("Webhook verificado com sucesso!")
             return Response(challenge, status=200)
@@ -47,25 +105,35 @@ def webhook():
 
         # 1. Verificar Assinatura
         signature_header = request.headers.get('X-Hub-Signature-256', '')
+        if not APP_SECRET:
+             print("Erro Crítico: APP_SECRET não está configurado!")
+             abort(500) # Internal Server Error - não podemos verificar
         if not signature_header.startswith('sha256='):
             print("Erro: Assinatura inválida (formato incorreto).")
             abort(403)
         signature_hash = signature_header.split('=')[1]
         request_body = request.data
-        expected_hash = hmac.new(
-            APP_SECRET.encode('utf-8'), request_body, hashlib.sha256
-        ).hexdigest()
+        try:
+            expected_hash = hmac.new(
+                APP_SECRET.encode('utf-8'), request_body, hashlib.sha256
+            ).hexdigest()
+        except Exception as e:
+            print(f"Erro ao gerar hash HMAC: {e}")
+            abort(500)
+
         if not hmac.compare_digest(signature_hash, expected_hash):
-            print("Erro: Assinatura inválida (hashes não correspondem).")
+            print(f"Erro: Assinatura inválida. Recebido: {signature_hash}, Esperado: {expected_hash}")
             abort(403)
         print("Assinatura verificada com sucesso.")
 
         # 2. Processar o Payload JSON
         data = request.get_json()
-        # print("Payload recebido:", json.dumps(data, indent=2))
+        db = None # Inicializa db para garantir que exista no bloco finally
+        try:
+            db = get_db() # Obtém conexão com o DB para esta requisição
+            cursor = db.cursor()
 
-        if data.get('object') == 'whatsapp_business_account':
-            try:
+            if data.get('object') == 'whatsapp_business_account':
                 for entry in data.get('entry', []):
                     for change in entry.get('changes', []):
                         value = change.get('value', {})
@@ -74,79 +142,139 @@ def webhook():
                                 if 'from' in message and message.get('type'):
                                     sender_id = message['from']
                                     message_type = message['type']
-                                    timestamp = int(message['timestamp']) # Converte para int
-
+                                    timestamp = int(message['timestamp'])
                                     print(f"Mensagem recebida de {sender_id} (Tipo: {message_type})")
 
-                                    # --- LÓGICA PARA CONTAR NOVA CONVERSA ---
-                                    with data_lock: # Garante acesso seguro às variáveis compartilhadas
-                                        is_new_conversation = False
-                                        current_status = conversation_status.get(sender_id)
+                                    # --- LÓGICA COM BANCO DE DADOS ---
+                                    cursor.execute("SELECT status FROM conversations WHERE sender_id = ?", (sender_id,))
+                                    result = cursor.fetchone() # Retorna um objeto Row ou None
 
-                                        if not current_status:
-                                            # Primeira mensagem deste remetente
-                                            is_new_conversation = True
-                                            print(f"Primeira mensagem detectada de {sender_id}.")
-                                        elif current_status['status'] == 'closed':
-                                            # Mensagem recebida após a conversa ser fechada
-                                            # (Você precisará implementar a lógica de 'fechar')
-                                            is_new_conversation = True
-                                            print(f"Nova conversa detectada de {sender_id} (anterior estava fechada).")
-                                        # Adicione outras lógicas se necessário (ex: tempo limite)
-                                        # elif time.time() - current_status.get('last_update', 0) > TEMPO_LIMITE_SEGUNDOS:
-                                        #    is_new_conversation = True
-                                        #    print(f"Nova conversa detectada de {sender_id} (tempo limite excedido).")
+                                    is_new_conversation = False
+                                    if result is None:
+                                        is_new_conversation = True
+                                        print(f"Primeira mensagem detectada de {sender_id}.")
+                                    # Acessa o status pelo nome da coluna se result não for None
+                                    elif result['status'] == 'closed':
+                                        is_new_conversation = True
+                                        print(f"Nova conversa detectada de {sender_id} (anterior estava fechada).")
 
+                                    if is_new_conversation:
+                                        # Incrementa contador no DB
+                                        cursor.execute("UPDATE counters SET value = value + 1 WHERE counter_name = ?", ('new_conversation_count',))
+                                        # Insere ou atualiza conversa para 'open'
+                                        cursor.execute('''
+                                            INSERT OR REPLACE INTO conversations (sender_id, status, last_update)
+                                            VALUES (?, ?, ?)
+                                        ''', (sender_id, 'open', timestamp))
+                                        db.commit() # Salva ambas as alterações (contador e status)
 
-                                        if is_new_conversation:
-                                            new_conversation_count += 1
-                                            conversation_status[sender_id] = {
-                                                'status': 'open',
-                                                'last_update': timestamp
-                                            }
-                                            print(f"CONTADOR DE NOVAS CONVERSAS: {new_conversation_count}")
-                                            print(f"Conversa com {sender_id} marcada como ABERTA.")
-                                        else:
-                                             # Atualiza apenas o timestamp da conversa existente
-                                            conversation_status[sender_id]['last_update'] = timestamp
-                                            print(f"Mensagem recebida na conversa aberta com {sender_id}.")
+                                        # Busca o novo valor do contador para logar (opcional)
+                                        cursor.execute("SELECT value FROM counters WHERE counter_name = ?", ('new_conversation_count',))
+                                        count_result = cursor.fetchone()
+                                        current_count = count_result['value'] if count_result else 'ERRO'
+                                        print(f"CONTADOR DE NOVAS CONVERSAS: {current_count}")
+                                        print(f"Conversa com {sender_id} marcada como ABERTA no DB.")
+                                    else:
+                                        # Atualiza apenas o timestamp da conversa existente
+                                        cursor.execute("UPDATE conversations SET last_update = ? WHERE sender_id = ?", (timestamp, sender_id))
+                                        db.commit() # Salva a atualização do timestamp
+                                        print(f"Mensagem recebida na conversa aberta com {sender_id} (timestamp atualizado no DB).")
 
+            # Retorna 200 OK para a Meta mesmo se ocorrer um erro interno no processamento
+            # A Meta se importa apenas em saber se você recebeu o webhook
+            return Response(status=200)
 
-            except Exception as e:
-                print(f"Erro ao processar payload: {e}")
-                pass
+        except sqlite3.Error as e:
+            print(f"Erro de Banco de Dados SQLite durante POST: {e}")
+            if db: db.rollback() # Desfaz alterações se possível
+            # Não aborte a requisição, apenas logue o erro e retorne 200
+            return Response(status=200)
+        except Exception as e:
+            print(f"Erro inesperado durante POST: {e}")
+            if db: db.rollback()
+             # Não aborte a requisição, apenas logue o erro e retorne 200
+            return Response(status=200)
+        # O fechamento da conexão é tratado automaticamente por @app.teardown_appcontext
 
-        return Response(status=200)
     else:
-        abort(405)
+        abort(405) # Method Not Allowed
 
-# --- Rotas para verificar estado (Exemplo) ---
+# --- Rotas para verificar estado (Modificadas para usar DB) ---
+
 @app.route('/count', methods=['GET'])
 def get_count():
-    global new_conversation_count
-    with data_lock:
-        return json.dumps({"new_conversation_count": new_conversation_count})
+    """Retorna a contagem atual de novas conversas do banco de dados."""
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT value FROM counters WHERE counter_name = ?", ('new_conversation_count',))
+        result = cursor.fetchone()
+        if result:
+            return json.dumps({"new_conversation_count": result['value']})
+        else:
+            # Se o contador não foi inicializado por algum motivo
+            return json.dumps({"error": "Contador 'new_conversation_count' não encontrado no DB"}), 404
+    except sqlite3.Error as e:
+        print(f"Erro de DB em /count: {e}")
+        return json.dumps({"error": "Erro ao acessar banco de dados"}), 500
+    except Exception as e:
+        print(f"Erro inesperado em /count: {e}")
+        return json.dumps({"error": "Erro interno do servidor"}), 500
+
 
 @app.route('/status', methods=['GET'])
 def get_all_statuses():
-    global conversation_status
-    with data_lock:
-        # Cria cópia para evitar problemas de concorrência ao retornar
-        status_copy = conversation_status.copy()
-    return json.dumps(status_copy)
+    """Retorna o status de todas as conversas do banco de dados."""
+    all_statuses = {}
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        # Seleciona todas as colunas e ordena pelas mais recentes
+        cursor.execute("SELECT sender_id, status, last_update FROM conversations ORDER BY last_update DESC")
+        results = cursor.fetchall() # Pega todas as linhas
+        for row in results:
+            # Converte o objeto sqlite3.Row para um dicionário padrão
+            all_statuses[row['sender_id']] = dict(row)
+        return json.dumps(all_statuses)
+    except sqlite3.Error as e:
+        print(f"Erro de DB em /status: {e}")
+        return json.dumps({"error": "Erro ao acessar banco de dados"}), 500
+    except Exception as e:
+        print(f"Erro inesperado em /status: {e}")
+        return json.dumps({"error": "Erro interno do servidor"}), 500
 
-# Exemplo de rota para FECHAR uma conversa (apenas para teste)
+
 @app.route('/close/<sender_id>', methods=['POST'])
 def close_conversation(sender_id):
-    global conversation_status
-    with data_lock:
-        if sender_id in conversation_status:
-            conversation_status[sender_id]['status'] = 'closed'
-            print(f"Conversa com {sender_id} marcada como FECHADA manualmente.")
+    """Marca uma conversa específica como 'closed' no banco de dados."""
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        # Atualiza o status apenas se o sender_id existir
+        cursor.execute("UPDATE conversations SET status = ? WHERE sender_id = ?", ('closed', sender_id))
+        affected_rows = cursor.rowcount # Verifica se alguma linha foi realmente atualizada
+        db.commit()
+        if affected_rows > 0:
+            print(f"Conversa com {sender_id} marcada como FECHADA no DB.")
             return json.dumps({"status": "closed"})
         else:
+            # Se o sender_id não existia na tabela
+            print(f"Tentativa de fechar conversa com {sender_id}, mas não foi encontrada.")
             return json.dumps({"status": "not_found"}), 404
+    except sqlite3.Error as e:
+        print(f"Erro de DB em /close/{sender_id}: {e}")
+        if db: db.rollback()
+        return json.dumps({"error": "Erro ao acessar banco de dados"}), 500
+    except Exception as e:
+        print(f"Erro inesperado em /close/{sender_id}: {e}")
+        if db: db.rollback()
+        return json.dumps({"error": "Erro interno do servidor"}), 500
 
+
+# --- Inicialização ---
 if __name__ == '__main__':
+    # Garante que o banco de dados e as tabelas sejam criados na inicialização
+    init_db()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True) # Mude debug=False para produção
+    # !! MUDE debug=False para produção !!
+    app.run(host='0.0.0.0', port=port, debug=True)
