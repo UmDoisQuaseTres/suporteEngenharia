@@ -262,6 +262,9 @@ whatsapp_data_v2.db
 # LSP config files
 pyrightconfig.json
 
+# Dados do Banco de Dados Local (Gerenciado por Volume)
+db_data/
+
 ### venv ###
 # Virtualenv
 # http://iamzed.com/2009/05/07/a-primer-on-virtualenv/

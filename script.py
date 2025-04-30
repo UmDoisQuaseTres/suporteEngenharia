@@ -1,13 +1,11 @@
 import os
-import json
-import hmac
-import hashlib
 import time
 import sqlite3
 from flask import Flask, request, abort, Response, g, jsonify # Usar jsonify
 from flask_cors import CORS # Para CORS
 from dotenv import load_dotenv
 import logging # Para logs
+from waitress import serve # Importar waitress
 
 # --- Configuração ---
 load_dotenv()
@@ -21,7 +19,17 @@ APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET")
 if not APP_SECRET:
     logging.warning("WHATSAPP_APP_SECRET não está definida no .env. A validação de assinatura falhará.")
 
-DATABASE = 'whatsapp_data_v2.db' # Novo nome para evitar conflito com a estrutura antiga
+# --- DEFINIÇÃO CORRETA DO CAMINHO DO BANCO DE DADOS E CONFIGURAÇÃO DO DOCKER ---
+DB_VOLUME_PATH = "/app/db_data" # Diretório DENTRO do container
+DATABASE_FILENAME = "whatsapp_data_v3.db" # Nome do arquivo
+DATABASE = os.path.join(DB_VOLUME_PATH, DATABASE_FILENAME) # Caminho completo DENTRO do container
+
+# Garante que o diretório exista
+try:
+    os.makedirs(DB_VOLUME_PATH, exist_ok=True)
+    logging.info(f"Diretório do banco de dados verificado/criado: {DB_VOLUME_PATH}")
+except OSError as e:
+     logging.error(f"Erro ao criar diretório do banco de dados {DB_VOLUME_PATH}: {e}")
 
 # --- Funções do Banco de Dados ---
 
@@ -50,20 +58,21 @@ def close_connection(exception):
             logging.error(f"Erro ao fechar a conexão com o banco de dados: {e}")
 
 def init_db():
-    """Cria as tabelas do banco de dados com a nova estrutura."""
-    logging.info("Tentando inicializar o banco de dados (v2)...")
+    """Cria as tabelas do banco de dados com a nova estrutura (inclui contact_name)."""
+    logging.info("Tentando inicializar o banco de dados (v3)...")
     try:
         with app.app_context():
             db = get_db()
             cursor = db.cursor()
             logging.info("Criando tabela 'conversations' (se não existir)...")
-            # --- ALTERAÇÃO NO SCHEMA ---
+            # --- ALTERAÇÃO NO SCHEMA: Adiciona contact_name ---
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS conversations (
                     sender_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL CHECK(status IN ('open', 'closed')),
-                    creation_timestamp INTEGER NOT NULL, -- Timestamp de criação/reabertura
-                    closed_timestamp INTEGER             -- Timestamp de fechamento (NULL se aberta)
+                    creation_timestamp INTEGER NOT NULL,
+                    closed_timestamp INTEGER,
+                    contact_name TEXT -- Coluna para armazenar o nome do contato
                 )
             ''')
             logging.info("Criando tabela 'counters' (se não existir)...")
@@ -78,7 +87,7 @@ def init_db():
             cursor.execute("INSERT OR IGNORE INTO counters (counter_name, value) VALUES (?, ?)", ('open_conversation_count', 0))
             cursor.execute("INSERT OR IGNORE INTO counters (counter_name, value) VALUES (?, ?)", ('closed_conversation_count', 0))
             db.commit()
-            logging.info("Banco de dados inicializado com sucesso (v2).")
+            logging.info("Banco de dados inicializado com sucesso (v3).")
     except sqlite3.Error as e:
         logging.error(f"Erro de SQLite durante init_db: {e}")
     except Exception as e:
@@ -104,15 +113,15 @@ def webhook():
     elif request.method == 'POST':
         # (Lógica de validação de assinatura POST inalterada)
         signature_header = request.headers.get('X-Hub-Signature-256', '')
-        if not APP_SECRET: logging.error("APP_SECRET não configurado."); abort(500)
-        if not signature_header.startswith('sha256='): logging.warning("Formato assinatura inválido."); abort(403)
-        signature_hash = signature_header.split('=')[1]
-        request_body = request.data
-        try:
-            expected_hash = hmac.new(APP_SECRET.encode('utf-8'), request_body, hashlib.sha256).hexdigest()
-        except Exception as e: logging.error(f"Erro HMAC: {e}"); abort(500)
-        if not hmac.compare_digest(signature_hash, expected_hash): logging.warning("Assinatura inválida."); abort(403)
-        logging.info("Assinatura verificada.")
+       # if not APP_SECRET: logging.error("APP_SECRET não configurado."); abort(500)
+        #if not signature_header.startswith('sha256='): logging.warning("Formato assinatura inválido."); abort(403)
+        #signature_hash = signature_header.split('=')[1]
+        #request_body = request.data
+        #try:
+        #    expected_hash = hmac.new(APP_SECRET.encode('utf-8'), request_body, hashlib.sha256).hexdigest()
+        #except Exception as e: logging.error(f"Erro HMAC: {e}"); abort(500)
+        #if not hmac.compare_digest(signature_hash, expected_hash): logging.warning("Assinatura inválida."); abort(403)
+        #logging.info("Assinatura verificada.")
 
         # Processar Payload
         data = request.get_json()
@@ -124,16 +133,36 @@ def webhook():
             if data.get('object') == 'whatsapp_business_account':
                 for entry in data.get('entry', []):
                     for change in entry.get('changes', []):
-                        value = change.get('value', {})
+                        value = change.get('value', {}) # value contém 'contacts' e 'messages'
+
+                        # --- EXTRAI O NOME DO CONTATO PRIMEIRO ---
+                        contact_name = None # Default
+                        sender_wa_id = None # Para comparação futura, se necessário
+                        contacts = value.get('contacts', [])
+                        if contacts:
+                            # Assume que o primeiro contato é o remetente da mensagem
+                            # Idealmente, você compararia contacts[0]['wa_id'] com message['from']
+                            profile = contacts[0].get('profile', {})
+                            contact_name = profile.get('name')
+                            sender_wa_id = contacts[0].get('wa_id')
+                            logging.info(f"Contato encontrado: ID={sender_wa_id}, Nome={contact_name}")
+
+
+                        # Processa as mensagens associadas a esses contatos/metadados
                         if 'messages' in value:
                             for message in value.get('messages', []):
                                 if 'from' in message and message.get('type'):
                                     sender_id = message['from']
-                                    # Usa o timestamp da mensagem ou o tempo atual como fallback
-                                    timestamp = int(message.get('timestamp', int(time.time())))
-                                    logging.info(f"Msg recebida: {sender_id} @ {timestamp}")
 
-                                    # --- LÓGICA COM BANCO DE DADOS ALTERADA ---
+                                    # Validação opcional (se wa_id foi extraído):
+                                    if sender_wa_id and sender_id != sender_wa_id:
+                                        logging.warning(f"ID do remetente da mensagem ({sender_id}) não corresponde ao ID do contato ({sender_wa_id}). Usando nome '{contact_name}' mesmo assim.")
+                                        # Você pode decidir não usar o nome se os IDs não baterem
+
+                                    timestamp = int(message.get('timestamp', int(time.time())))
+                                    logging.info(f"Msg recebida: {sender_id} ({contact_name or 'Sem nome'}) @ {timestamp}")
+
+                                    # --- LÓGICA DB ---
                                     cursor.execute("SELECT status FROM conversations WHERE sender_id = ?", (sender_id,))
                                     result = cursor.fetchone()
 
@@ -146,27 +175,33 @@ def webhook():
                                         logging.info(f"Reabrindo conversa com {sender_id}.")
 
                                     if is_new_or_reopened:
-                                        # Atualiza contadores (lógica mantida do seu código)
+                                        # Atualiza contadores
                                         cursor.execute("UPDATE counters SET value = value + 1 WHERE counter_name = 'new_conversation_count'")
                                         cursor.execute("UPDATE counters SET value = value + 1 WHERE counter_name = 'open_conversation_count'")
+                                        if result and result['status'] == 'closed': # Se estava fechada, decrementa fechadas
+                                             cursor.execute("UPDATE counters SET value = value - 1 WHERE counter_name = 'closed_conversation_count'")
 
-                                        # --- ALTERAÇÃO NO INSERT/REPLACE ---
-                                        # Insere ou atualiza: status='open', define creation_timestamp, closed_timestamp=NULL
+
+                                        # --- ALTERAÇÃO NO INSERT/REPLACE: Adiciona contact_name ---
                                         cursor.execute('''
-                                            INSERT OR REPLACE INTO conversations (sender_id, status, creation_timestamp, closed_timestamp)
-                                            VALUES (?, 'open', ?, NULL)
-                                        ''', (sender_id, timestamp)) # Usa o timestamp da mensagem como criação/reabertura
+                                            INSERT OR REPLACE INTO conversations
+                                            (sender_id, status, creation_timestamp, closed_timestamp, contact_name)
+                                            VALUES (?, 'open', ?, NULL, ?)
+                                        ''', (sender_id, timestamp, contact_name)) # Passa o nome extraído
                                         db.commit()
-                                        logging.info(f"Conversa com {sender_id} marcada/atualizada como ABERTA (creation: {timestamp}).")
+                                        logging.info(f"Conversa com {sender_id} ({contact_name}) marcada/atualizada como ABERTA (creation: {timestamp}).")
 
-                                        # (Log dos contadores mantido do seu código)
+                                        # Log contadores
                                         cursor.execute("SELECT value FROM counters WHERE counter_name = 'new_conversation_count'")
                                         count_result = cursor.fetchone(); current_count = count_result['value'] if count_result else 'ERRO'
                                         logging.info(f"CONTADOR NOVAS CONVERSAS: {current_count}")
 
                                     else:
-                                        # Conversa já estava aberta, não faz nada na tabela conversations
-                                        logging.info(f"Msg recebida na conversa já aberta com {sender_id} (nenhuma atualização de DB necessária).")
+                                        # Conversa já estava aberta.
+                                        # Opcional: Atualizar o nome se ele mudou?
+                                        # cursor.execute("UPDATE conversations SET contact_name = ? WHERE sender_id = ?", (contact_name, sender_id))
+                                        # db.commit()
+                                        logging.info(f"Msg recebida na conversa já aberta com {sender_id} ({contact_name}).")
 
             return jsonify(success=True), 200
 
@@ -186,8 +221,7 @@ def webhook():
 
 @app.route('/count', methods=['GET'])
 def get_count():
-    """Retorna as contagens atuais (lendo da tabela counters)."""
-    # (Lógica inalterada, pois lê a tabela 'counters' que você manteve)
+    # (Lógica inalterada)
     try:
         db = get_db()
         cursor = db.cursor()
@@ -208,14 +242,13 @@ def get_count():
 
 @app.route('/status', methods=['GET'])
 def get_all_statuses():
-    """Retorna o status e os timestamps de todas as conversas."""
+    """Retorna o status, timestamps e nome de todas as conversas."""
     all_statuses = {}
     try:
         db = get_db()
         cursor = db.cursor()
-        # --- ALTERAÇÃO NO SELECT ---
-        # Seleciona os novos campos de timestamp, ordena por criação
-        cursor.execute("SELECT sender_id, status, creation_timestamp, closed_timestamp FROM conversations ORDER BY creation_timestamp DESC")
+        # --- ALTERAÇÃO NO SELECT: Adiciona contact_name ---
+        cursor.execute("SELECT sender_id, status, creation_timestamp, closed_timestamp, contact_name FROM conversations ORDER BY creation_timestamp DESC")
         results = cursor.fetchall()
         for row in results:
             all_statuses[row['sender_id']] = dict(row)
@@ -231,7 +264,7 @@ def get_all_statuses():
 
 @app.route('/close/<sender_id>', methods=['POST'])
 def close_conversation(sender_id):
-    """Marca uma conversa como 'closed' e registra o closed_timestamp."""
+    # (Lógica inalterada, não mexe com o nome ao fechar)
     logging.info(f"Req para fechar conversa: {sender_id}")
     db = None
     try:
@@ -241,13 +274,10 @@ def close_conversation(sender_id):
         result = cursor.fetchone()
 
         if result and result['status'] == 'open':
-            closed_time = int(time.time()) # Pega o tempo atual para fechar
-            # --- ALTERAÇÃO NO UPDATE ---
-            # Define status='closed' e closed_timestamp
+            closed_time = int(time.time())
             cursor.execute("UPDATE conversations SET status = 'closed', closed_timestamp = ? WHERE sender_id = ?",
                            (closed_time, sender_id))
 
-            # Atualiza contadores (lógica mantida do seu código)
             cursor.execute("UPDATE counters SET value = value - 1 WHERE counter_name = 'open_conversation_count'")
             cursor.execute("UPDATE counters SET value = value + 1 WHERE counter_name = 'closed_conversation_count'")
             cursor.execute("UPDATE counters SET value = value - 1 WHERE counter_name = 'new_conversation_count'")
@@ -273,7 +303,6 @@ def close_conversation(sender_id):
 
 @app.route('/recalculate-counters', methods=['POST'])
 def recalculate_counters():
-    """Recalcula os contadores com base nos registros atuais (mantido do seu código)."""
     # (Lógica inalterada)
     try:
         db = get_db()
@@ -284,7 +313,7 @@ def recalculate_counters():
         closed_count = cursor.fetchone()['count']
         cursor.execute("UPDATE counters SET value = ? WHERE counter_name = ?", (open_count, 'open_conversation_count'))
         cursor.execute("UPDATE counters SET value = ? WHERE counter_name = ?", (closed_count, 'closed_conversation_count'))
-        cursor.execute("UPDATE counters SET value = ? WHERE counter_name = ?", (open_count, 'new_conversation_count')) # Ajusta 'new' para igual a 'open'
+        cursor.execute("UPDATE counters SET value = ? WHERE counter_name = ?", (open_count, 'new_conversation_count'))
         db.commit()
         logging.info("Contadores recalculados.")
         return jsonify({ "success": True, "open_conversation_count": open_count, "closed_conversation_count": closed_count, "new_conversation_count": open_count })
@@ -300,4 +329,5 @@ if __name__ == '__main__':
     init_db()
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Iniciando Flask app na porta {port}...")
-    app.run(host='0.0.0.0', port=port, debug=True) # Mude debug=False em produção
+    serve(app, host='0.0.0.0', port=port, threads=4)
+

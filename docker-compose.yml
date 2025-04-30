@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  whatsapp-api:             # Nome lógico do serviço
+    build: .                # Constrói a imagem a partir do Dockerfile na pasta atual (.)
+    container_name: whatsapp_api_prod_local # Nome fácil de identificar para o container
+    restart: unless-stopped # Reinicia automaticamente a menos que parado manualmente
+    ports:
+      - "5000:5000"         # Mapeia a porta 5000 do seu PC (HOST) para a porta 5000 do CONTAINER
+    volumes:
+      # Mapeia a pasta './db_data' no seu PC (HOST) para '/app/db_data' no CONTAINER
+      # O arquivo SQLite será criado/lido/escrito DENTRO desta pasta no seu PC.
+      - ./db_data:/app/db_data
+    env_file:
+      - ./.env              # Carrega as variáveis do arquivo .env para o ambiente do container
+    environment:
+      - PORT=5000
