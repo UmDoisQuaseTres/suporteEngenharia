@@ -3,7 +3,7 @@ version: '3.8'
 services:
   whatsapp-api:             # Nome lógico do serviço
     build: .                # Constrói a imagem a partir do Dockerfile na pasta atual (.)
-    container_name: whatsapp_api_prod_local # Nome fácil de identificar para o container
+    container_name: SuporteAPI # Nome fácil de identificar para o container
     restart: unless-stopped # Reinicia automaticamente a menos que parado manualmente
     ports:
       - "5000:5000"         # Mapeia a porta 5000 do seu PC (HOST) para a porta 5000 do CONTAINER

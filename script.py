@@ -9,6 +9,7 @@ from waitress import serve # Importar waitress
 
 # --- Configuração ---
 load_dotenv()
+
 app = Flask(__name__)
 CORS(app) # Habilita CORS
 
